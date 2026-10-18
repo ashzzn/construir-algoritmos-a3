@@ -4,6 +4,8 @@ import folium
 
 BASE_URL = "https://api.olhovivo.sptrans.com.br/v2.1"
 
+LINHAS_DOS_SLIDES = {2506, 841, 33609, 2273}
+
 
 def criar_mapa():
     token = os.getenv("SPTRANS_TOKEN")
@@ -15,136 +17,185 @@ def criar_mapa():
 
     sessao = requests.Session()
 
-
     resposta = sessao.post(
         f"{BASE_URL}/Login/Autenticar",
         params={"token": token},
-        timeout=30
+        timeout=20
     )
     resposta.raise_for_status()
 
     if resposta.text.strip().lower() != "true":
         raise ValueError(
-            "Falha na autenticação. Confira se o token é válido."
+            "Falha na autenticação. Confira seu token da SPTrans."
         )
 
-    print("Autenticação realizada!")
-
+    print("Autenticação realizada com sucesso!")
 
     resposta = sessao.get(
         f"{BASE_URL}/Linha/Buscar",
         params={"termosBusca": "8000"},
-        timeout=30
+        timeout=20
     )
     resposta.raise_for_status()
+
     linhas = resposta.json()
 
     if not linhas:
-        raise ValueError("A API não retornou linhas para a busca 8000.")
-
+        raise ValueError(
+            "Nenhuma linha encontrada para o termo 8000. "
+            "Tente outro termo de busca."
+        )
 
     linha_escolhida = None
     paradas = []
 
     for linha in linhas:
-        codigo = linha["cl"]
+        codigo = linha.get("cl")
 
-        resposta = sessao.get(
+        if codigo is None or codigo in LINHAS_DOS_SLIDES:
+            continue
+
+        resposta_paradas = sessao.get(
             f"{BASE_URL}/Parada/BuscarParadasPorLinha",
             params={"codigoLinha": codigo},
-            timeout=30
+            timeout=20
         )
-        resposta.raise_for_status()
-        paradas_teste = resposta.json()
+        resposta_paradas.raise_for_status()
 
-        if paradas_teste:
+        paradas_candidatas = resposta_paradas.json()
+
+        if paradas_candidatas:
             linha_escolhida = linha
-            paradas = paradas_teste
+            paradas = paradas_candidatas
             break
 
     if linha_escolhida is None:
         raise ValueError(
-            "Nenhuma das linhas encontradas retornou paradas."
+            "Não foi encontrada uma linha diferente das usadas nos "
+            "slides com paradas cadastradas. Tente alterar o termo "
+            "de busca ou conferir os códigos das linhas disponíveis."
         )
 
     codigo_linha = linha_escolhida["cl"]
-    print("Linha selecionada:", linha_escolhida["lt"])
-    print("Origem:", linha_escolhida["tp"])
-    print("Destino:", linha_escolhida["ts"])
-    print("Quantidade de paradas:", len(paradas))
 
-
-    resposta = sessao.get(
-        f"{BASE_URL}/Posicao/Linha",
-        params={"codigoLinha": codigo_linha},
-        timeout=30
+    print(
+        f"Linha selecionada: {linha_escolhida.get('lt', 'Sem letreiro')}"
     )
-    resposta.raise_for_status()
-    dados = resposta.json()
-    onibus = dados.get("vs", [])
+    print(f"Código da linha: {codigo_linha}")
+    print(f"Paradas encontradas: {len(paradas)}")
 
-    print("Ônibus encontrados:", len(onibus))
-
-
-    latitude = sum(p["py"] for p in paradas) / len(paradas)
-    longitude = sum(p["px"] for p in paradas) / len(paradas)
-
-    mapa = folium.Map(
-    location=[latitude, longitude],
-    zoom_start=13,
-    tiles="CartoDB positron"
-
-    )
-
-    grupo_paradas = folium.FeatureGroup(name="Paradas")
+    coordenadas = []
 
     for parada in paradas:
-        folium.Marker(
-            location=[parada["py"], parada["px"]],
-            popup=(
-                f"<b>Parada:</b> {parada.get('np', 'Sem nome')}<br>"
-                f"<b>Endereço:</b> {parada.get('ed', 'Não informado')}"
-            ),
-            tooltip=parada.get("np", "Parada"),
-            icon=folium.Icon(
-                color="blue",
-                icon="info-sign"
-            )
-        ).add_to(grupo_paradas)
+        try:
+            latitude = float(parada.get("py", 0))
+            longitude = float(parada.get("px", 0))
+
+            if latitude != 0 and longitude != 0:
+                coordenadas.append((latitude, longitude))
+        except (TypeError, ValueError):
+            continue
+
+    if not coordenadas:
+        raise ValueError(
+            "A linha selecionada não possui coordenadas válidas."
+        )
+
+    centro_lat = sum(lat for lat, lon in coordenadas) / len(coordenadas)
+    centro_lon = sum(lon for lat, lon in coordenadas) / len(coordenadas)
+
+    mapa = folium.Map(
+        location=[centro_lat, centro_lon],
+        zoom_start=13
+    )
+
+    grupo_paradas = folium.FeatureGroup(name="Paradas de ônibus")
+
+    for parada in paradas:
+        try:
+            latitude = float(parada.get("py", 0))
+            longitude = float(parada.get("px", 0))
+
+            if latitude == 0 or longitude == 0:
+                continue
+
+            nome = parada.get("np", "Parada sem nome")
+            codigo_parada = parada.get("cp", "Não informado")
+
+            folium.Marker(
+                location=[latitude, longitude],
+                popup=(
+                    f"<b>{nome}</b><br>"
+                    f"Código da parada: {codigo_parada}"
+                ),
+                tooltip=nome,
+                icon=folium.Icon(
+                    color="blue",
+                    icon="info-sign"
+                )
+            ).add_to(grupo_paradas)
+
+        except (TypeError, ValueError):
+            continue
 
     grupo_paradas.add_to(mapa)
 
+    resposta_posicoes = sessao.get(
+        f"{BASE_URL}/Posicao/Linha",
+        params={"codigoLinha": codigo_linha},
+        timeout=20
+    )
+    resposta_posicoes.raise_for_status()
 
-    grupo_onibus = folium.FeatureGroup(name="Ônibus em circulação")
+    dados = resposta_posicoes.json()
+    veiculos = dados.get("vs", [])
 
-    for veiculo in onibus:
-        folium.Marker(
-            location=[veiculo["py"], veiculo["px"]],
-            popup=(
-                f"<b>Prefixo:</b> {veiculo.get('p', 'Não informado')}<br>"
-                f"<b>Acessível:</b> "
-                f"{'Sim' if veiculo.get('a') else 'Não'}<br>"
-                f"<b>Última atualização:</b> "
-                f"{veiculo.get('ta', 'Não informada')}"
-            ),
-            tooltip=f"Ônibus {veiculo.get('p', '')}",
-            icon=folium.Icon(
-                color="red",
-                icon="bus",
-                prefix="fa"
-            )
-        ).add_to(grupo_onibus)
+    print(f"Ônibus encontrados em tempo real: {len(veiculos)}")
+
+    grupo_onibus = folium.FeatureGroup(name="Ônibus em tempo real")
+
+    for veiculo in veiculos:
+        try:
+            latitude = float(veiculo.get("py", 0))
+            longitude = float(veiculo.get("px", 0))
+
+            if latitude == 0 or longitude == 0:
+                continue
+
+            prefixo = veiculo.get("p", "Não informado")
+
+            folium.Marker(
+                location=[latitude, longitude],
+                popup=(
+                    f"<b>Ônibus</b><br>"
+                    f"Prefixo: {prefixo}<br>"
+                    f"Linha: {linha_escolhida.get('lt', 'Não informado')}"
+                ),
+                tooltip=f"Ônibus {prefixo}",
+                icon=folium.Icon(
+                    color="red",
+                    icon="bus",
+                    prefix="fa"
+                )
+            ).add_to(grupo_onibus)
+
+        except (TypeError, ValueError):
+            continue
 
     grupo_onibus.add_to(mapa)
 
     folium.LayerControl().add_to(mapa)
 
+    arquivo = "mapa_frota.html"
+    mapa.save(arquivo)
 
-    mapa.save("mapa_frota.html")
+    print(f"Mapa salvo em: {os.path.abspath(arquivo)}")
+    print("Abra o arquivo mapa_frota.html no navegador.")
 
-    print("Mapa salvo em mapa_frota.html")
-    print("Abra esse arquivo no navegador para visualizar.")
+    return mapa
 
 
 if __name__ == "__main__":
     criar_mapa()
+
+#estou executando em ambiente virtual
